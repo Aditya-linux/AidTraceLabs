@@ -24,6 +24,15 @@ For planned work, open or comment on an issue and wait for an acknowledgment bef
 - Link the issue when one exists. Include screenshots only for user-facing changes and do not include real beneficiary data.
 - Complete the pull request checklist and respond to review feedback.
 
+## Stellar Wave contributions
+
+- Ask to be assigned in a comment before starting; wait for the maintainer to assign you.
+- The PR description must include "Closes #<issue number>".
+- Run `npm run check` (typecheck, lint, format check, tests, build) and paste the result summary in the PR.
+
+- Keep the PR within the issue's scope (see "Out of scope"); one issue per PR.
+- Tests are expected for behavior changes; PRs must be explainable by their author.
+
 ## Commit style
 
 Use concise Conventional Commit subjects, for example `fix: separate pseudonym secret` or `docs: clarify verification limits`. Keep commits small enough to review. Do not add trailers other than a truthful `Co-authored-by: Name <email>` trailer when a real co-author has agreed.
