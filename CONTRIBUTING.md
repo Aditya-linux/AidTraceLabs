@@ -29,7 +29,7 @@ For planned work, open or comment on an issue and wait for an acknowledgment bef
 - Ask to be assigned in a comment before starting; wait for the maintainer to assign you.
 - The PR description must include "Closes #<issue number>".
 - Run `npm run check` (typecheck, lint, format check, tests, build) and paste the result summary in the PR.
-- For UI changes include screenshots or a short recording.
+
 - Keep the PR within the issue's scope (see "Out of scope"); one issue per PR.
 - Tests are expected for behavior changes; PRs must be explainable by their author.
 
