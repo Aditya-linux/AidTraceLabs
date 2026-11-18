@@ -671,6 +671,47 @@ integration('Database-backed wallet, records, and authorization flows', () => {
     expect(duplicate.status).toBe(409);
   }, 120_000);
 
+  it('returns a filter-bounded total on transparency pages without walking every record', async () => {
+    const adminSession = await login(admin);
+    const organization = Keypair.random();
+    await assignRole(adminSession, organization, 'organization');
+    const session = await login(organization);
+    const recipient = Keypair.random();
+    const token = 'bounded-total-' + Date.now();
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response('{}', { status: 404 })),
+    );
+    for (let index = 0; index < 3; index += 1) {
+      const created = await createRecord(session, recipient, `${token} case ${index}`, {
+        txHash: createHash('sha256').update(`${token}-${index}`).digest('hex'),
+      });
+      expect(created.status).toBe(201);
+    }
+
+    const pageOne = await request(app).get('/api/transparency').query({ q: token, limit: '1' });
+    expect(pageOne.status).toBe(200);
+    expect(pageOne.body.records).toHaveLength(1);
+    expect(pageOne.body.total).toBe(3);
+    expect(pageOne.body.hasMore).toBe(true);
+    expect(typeof pageOne.body.nextCursor).toBe('string');
+
+    const pageTwo = await request(app)
+      .get('/api/transparency')
+      .query({ q: token, limit: '1', cursor: pageOne.body.nextCursor });
+    expect(pageTwo.status).toBe(200);
+    expect(pageTwo.body.records).toHaveLength(1);
+    expect(pageTwo.body.total).toBe(3);
+    expect(pageTwo.body.records[0].id).not.toBe(pageOne.body.records[0].id);
+
+    const tight = await request(app)
+      .get('/api/transparency')
+      .query({ q: `${token} case 1`, limit: '1' });
+    expect(tight.status).toBe(200);
+    expect(tight.body.total).toBe(1);
+    expect(tight.body.hasMore).toBe(false);
+  }, 120_000);
+
   it('paginates and filters public records while redacting beneficiary identifiers by default', async () => {
     const adminSession = await login(admin);
     const organization = Keypair.random();
