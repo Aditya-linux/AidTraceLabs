@@ -6,3 +6,4 @@ dist-server/
 !.env.example
 .neon
 .vercel
+vercel-out.txt
