@@ -1,4 +1,4 @@
-import { createHash, createHmac } from 'node:crypto';
+import { createHash, createHmac, randomBytes } from 'node:crypto';
 import { Keypair } from '@stellar/stellar-sdk';
 import request from 'supertest';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
@@ -6,6 +6,7 @@ import { applyUniqueNetworkTxHashMigration, migrate } from '../scripts/migrate.j
 import { app } from '../server/app.js';
 import { verifySep53Signature } from '../server/auth.js';
 import { pool } from '../server/db.js';
+import { runReverification } from '../server/reverification.js';
 import { checkTransaction } from '../server/stellar-verification.js';
 
 const origin = 'http://localhost:5173';
@@ -365,6 +366,29 @@ integration('Database-backed wallet, records, and authorization flows', () => {
     return response;
   }
 
+  async function prepareStaleRecord(purpose: string) {
+    const adminSession = await login(admin);
+    const organization = Keypair.random();
+    await assignRole(adminSession, organization, 'organization');
+    const session = await login(organization);
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response('{}', { status: 404 })),
+    );
+    const response = await createRecord(session, Keypair.random(), purpose, {
+      txHash: randomBytes(32).toString('hex'),
+    });
+    expect(response.status).toBe(201);
+    const recordId = response.body.record.id as string;
+    await pool.query(
+      `UPDATE verification_results
+       SET checked_at = NOW() - INTERVAL '25 hours', cache_expires_at = NULL
+       WHERE aid_record_id = $1`,
+      [recordId],
+    );
+    return { recordId, organization: organization.publicKey() };
+  }
+
   beforeAll(async () => {
     await migrate();
     admin = Keypair.random();
@@ -670,6 +694,129 @@ integration('Database-backed wallet, records, and authorization flows', () => {
     });
     expect(duplicate.status).toBe(409);
   }, 120_000);
+
+  it('claims no more than 50 stale eligible records and appends verification history', async () => {
+    const { recordId, organization } = await prepareStaleRecord('Reverification batch seed');
+    await pool.query(
+      'UPDATE verification_results SET checked_at = NOW() WHERE aid_record_id = $1',
+      [recordId],
+    );
+    const prefix = 'reverify-' + randomBytes(8).toString('hex') + '-';
+    const txPrefix = 'a'.repeat(62);
+    await pool.query(
+      `WITH generated AS (SELECT generate_series(1, 51) AS n),
+       records AS (
+         INSERT INTO aid_records
+           (id, organization_wallet, recipient_name, recipient_wallet, purpose, amount_stroops,
+            asset_code, asset_issuer, network, tx_hash, disbursement_date, status, created_by)
+         SELECT $1 || n, $2, 'Recipient', $3, 'batch verification', 10000000,
+                'XLM', '', 'testnet', $4 || LPAD(n::text, 2, '0'), CURRENT_DATE,
+                'verified', $2
+         FROM generated
+         RETURNING id
+       )
+       INSERT INTO verification_results (id, aid_record_id, status, checked_at)
+       SELECT id || '-initial', id, 'verified', NOW() - INTERVAL '25 hours'
+       FROM records`,
+      [prefix, organization, Keypair.random().publicKey(), txPrefix],
+    );
+    const generatedIds = Array.from({ length: 51 }, (_, index) => prefix + (index + 1));
+    generatedIds.forEach((id) => recordIds.add(id));
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response('{}', { status: 404 })),
+    );
+    const summary = await runReverification({ batchSize: 100, recordIds: generatedIds });
+    expect(summary).toMatchObject({
+      claimed: 50,
+      processed: 50,
+      pending: 0,
+      skipped: 0,
+      timedOut: false,
+    });
+    const counts = await pool.query<{ withHistory: string; stillStale: string }>(
+      `SELECT
+         COUNT(*) FILTER (WHERE history.count = 2)::text AS "withHistory",
+         COUNT(*) FILTER (WHERE latest.checked_at <= NOW() - INTERVAL '24 hours')::text
+           AS "stillStale"
+       FROM aid_records r
+       JOIN LATERAL (
+         SELECT COUNT(*) AS count FROM verification_results v WHERE v.aid_record_id = r.id
+       ) history ON TRUE
+       JOIN LATERAL (
+         SELECT checked_at FROM verification_results v
+         WHERE v.aid_record_id = r.id
+         ORDER BY checked_at DESC, id DESC LIMIT 1
+       ) latest ON TRUE
+       WHERE r.id = ANY($1::text[])`,
+      [generatedIds],
+    );
+    expect(counts.rows[0]).toEqual({ withHistory: '50', stillStale: '1' });
+    expect(await runReverification({ recordIds: generatedIds })).toMatchObject({
+      claimed: 1,
+      processed: 1,
+    });
+  }, 120_000);
+
+  it('prevents a concurrent run from claiming a record already being checked', async () => {
+    const { recordId } = await prepareStaleRecord('Concurrent reverification');
+    let startFetch!: () => void;
+    let finishFetch!: () => void;
+    const fetchStarted = new Promise<void>((resolve) => {
+      startFetch = resolve;
+    });
+    const fetchMayFinish = new Promise<void>((resolve) => {
+      finishFetch = resolve;
+    });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => {
+        startFetch();
+        await fetchMayFinish;
+        return new Response('{}', { status: 404 });
+      }),
+    );
+
+    const firstRun = runReverification({ recordIds: [recordId] });
+    await fetchStarted;
+    const concurrentRun = await runReverification({ recordIds: [recordId] });
+    expect(concurrentRun.claimed).toBe(0);
+    finishFetch();
+    expect(await firstRun).toMatchObject({ claimed: 1, processed: 1, pending: 0 });
+    const latest = await pool.query<{ status: string }>(
+      `SELECT status FROM verification_results
+       WHERE aid_record_id = $1 ORDER BY checked_at DESC, id DESC LIMIT 1`,
+      [recordId],
+    );
+    expect(latest.rows[0].status).toBe('not-found');
+  }, 30_000);
+
+  it('records a transient Horizon failure as pending while preserving earlier results', async () => {
+    const { recordId } = await prepareStaleRecord('Pending reverification');
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => Promise.reject(new Error('Horizon unavailable'))),
+    );
+
+    const summary = await runReverification({ recordIds: [recordId] });
+    expect(summary).toMatchObject({ claimed: 1, processed: 1, pending: 1 });
+    const result = await pool.query<{ status: string; count: string }>(
+      `SELECT latest.status, history.count::text AS count
+       FROM (SELECT COUNT(*) AS count FROM verification_results WHERE aid_record_id = $1) history
+       JOIN LATERAL (
+         SELECT status FROM verification_results WHERE aid_record_id = $1
+         ORDER BY checked_at DESC, id DESC LIMIT 1
+       ) latest ON TRUE`,
+      [recordId],
+    );
+    expect(result.rows[0]).toEqual({ status: 'pending', count: '2' });
+    const record = await pool.query<{ status: string }>(
+      'SELECT status FROM aid_records WHERE id = $1',
+      [recordId],
+    );
+    expect(record.rows[0].status).toBe('pending');
+  }, 30_000);
 
   it('paginates and filters public records while redacting beneficiary identifiers by default', async () => {
     const adminSession = await login(admin);
