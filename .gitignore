@@ -7,3 +7,6 @@ dist-server/
 .neon
 .vercel
 vercel-out.txt
+
+# Agent session files
+.agents/
