@@ -276,6 +276,36 @@ integration('Database-backed wallet, records, and authorization flows', () => {
 
   afterEach(() => vi.unstubAllGlobals());
 
+  async function expectAuditEvent(
+    action: string,
+    actorWallet: string,
+    expected: { subjectWallet?: string; recordId?: string } = {},
+  ) {
+    const subjectWallet = expected.subjectWallet ?? null;
+    const recordId = expected.recordId ?? null;
+    const result = await pool.query<{
+      action: string;
+      actor_wallet: string;
+      subject_wallet: string | null;
+      record_id: string | null;
+    }>(
+      `SELECT action, actor_wallet, subject_wallet, record_id
+       FROM audit_events
+       WHERE action = $1 AND actor_wallet = $2
+         AND subject_wallet IS NOT DISTINCT FROM $3
+         AND record_id IS NOT DISTINCT FROM $4
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [action, actorWallet, subjectWallet, recordId],
+    );
+    expect(result.rows[0], `Missing ${action} audit event for ${actorWallet}`).toEqual({
+      action,
+      actor_wallet: actorWallet,
+      subject_wallet: subjectWallet,
+      record_id: recordId,
+    });
+  }
+
   async function login(wallet: Keypair) {
     const address = wallet.publicKey();
     wallets.add(address);
@@ -307,6 +337,7 @@ integration('Database-backed wallet, records, and authorization flows', () => {
       signature,
     });
     expect(verified.status).toBe(200);
+    await expectAuditEvent('wallet_authenticated', address);
     const cookieHeader = verified.headers['set-cookie'];
     const cookieLine = Array.isArray(cookieHeader) ? cookieHeader[0] : cookieHeader;
     expect(cookieLine).toContain('HttpOnly');
@@ -324,7 +355,7 @@ integration('Database-backed wallet, records, and authorization flows', () => {
   }
 
   async function assignRole(
-    session: { cookie: string; csrfToken: string },
+    session: { address: string; cookie: string; csrfToken: string },
     wallet: Keypair,
     role: 'organization' | 'beneficiary' | 'donor' | 'admin',
   ) {
@@ -335,10 +366,13 @@ integration('Database-backed wallet, records, and authorization flows', () => {
       .set('Cookie', session.cookie)
       .send({ csrfToken: session.csrfToken, address: wallet.publicKey(), role });
     expect(result.status).toBe(200);
+    await expectAuditEvent('wallet_role_changed', session.address, {
+      subjectWallet: wallet.publicKey(),
+    });
   }
 
   async function createRecord(
-    session: { cookie: string; csrfToken: string },
+    session: { address: string; cookie: string; csrfToken: string },
     recipient: Keypair,
     purpose: string,
     options: { txHash?: string; consent?: boolean } = {},
@@ -361,7 +395,12 @@ integration('Database-backed wallet, records, and authorization flows', () => {
         note: 'Private contact note',
         recipientConsent: options.consent || false,
       });
-    if (response.body.record?.id) recordIds.add(response.body.record.id);
+    if (response.status === 201 && response.body.record?.id) {
+      recordIds.add(response.body.record.id);
+      await expectAuditEvent('record_created', session.address, {
+        recordId: response.body.record.id,
+      });
+    }
     return response;
   }
 
@@ -512,6 +551,7 @@ integration('Database-backed wallet, records, and authorization flows', () => {
       .send({ csrfToken: session.csrfToken });
     expect(logout.status).toBe(200);
     expect(logout.headers['set-cookie']?.[0]).toContain('Max-Age=0');
+    await expectAuditEvent('wallet_logged_out', wallet.publicKey());
     expect(
       (await request(app).get('/api/me').set('Cookie', session.cookie)).body.session,
     ).toBeNull();
@@ -591,6 +631,9 @@ integration('Database-backed wallet, records, and authorization flows', () => {
         recipientConsent: cached.body.record.recipientConsent,
       });
     expect(editAfterVerify.status).toBe(200);
+    await expectAuditEvent('record_updated', session.address, {
+      recordId: verified.body.record.id,
+    });
 
     const wrongHash = '2'.padStart(64, '0');
     transactionBodies.set(wrongHash, {
@@ -890,6 +933,9 @@ integration('Database-backed wallet, records, and authorization flows', () => {
     expect(voided.body.record.status).toBe('voided');
     expect(voided.body.record.voidReason).toBe('Duplicate entry');
     expect(voided.body.record.voidedAt).toBeTruthy();
+    await expectAuditEvent('record_voided', ownerSession.address, {
+      recordId: owned.body.record.id,
+    });
     const visibleVoid = await request(app)
       .get('/api/transparency')
       .query({ status: 'voided', q: 'Owner record' });
@@ -916,6 +962,9 @@ integration('Database-backed wallet, records, and authorization flows', () => {
       .set('Cookie', adminSession.cookie)
       .send({ csrfToken: adminSession.csrfToken });
     expect(removed.status).toBe(200);
+    await expectAuditEvent('wallet_role_removed', adminSession.address, {
+      subjectWallet: removable.publicKey(),
+    });
 
     const selfRemove = await request(app)
       .delete('/api/admin/roles/' + encodeURIComponent(admin.publicKey()))
@@ -930,6 +979,7 @@ integration('Database-backed wallet, records, and authorization flows', () => {
       .set('Cookie', ownerSession.cookie)
       .send({ csrfToken: ownerSession.csrfToken });
     expect(logoutEverywhere.status).toBe(200);
+    await expectAuditEvent('wallet_logout_everywhere', ownerSession.address);
     expect(
       (await request(app).get('/api/me').set('Cookie', ownerSession.cookie)).body.session,
     ).toBeNull();
